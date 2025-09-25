@@ -1,5 +1,5 @@
-const supabaseUrl = "اینجا آدرس پروژه‌ات";
-const supabaseKey = "اینجا کلید عمومی‌ات";
+const supabaseUrl = "https://tjmmhqsjllbearwtavjm.supabase.co";
+const supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRqbW1ocXNqbGxiZWFyd3RhdmptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg4MDQxNTIsImV4cCI6MjA3NDM4MDE1Mn0.SeRhXUKNL6QHXf7skjChVmowIs67ZsDXkn8qBoYQvrs";
 const supabase = supabase.createClient(supabaseUrl, supabaseKey);
 
 document.getElementById("chatForm").addEventListener("submit", async function(e) {
