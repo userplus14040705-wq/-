@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="fa">
+<head>
+  <meta charset="UTF-8">
+  <title>چت ساده با Supabase</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <h2>ارسال پیام</h2>
+  <form id="chatForm">
+    <input type="text" id="messageInput" placeholder="پیام خود را بنویسید">
+    <button type="submit">ارسال</button>
+  </form>
+  <div id="chatBox"></div>
+</body>
+</html>
