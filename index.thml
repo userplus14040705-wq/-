@@ -1,17 +1,1021 @@
-<!DOCTYPE html>
-<html lang="fa">
+<?php
+session_start();
+require_once __DIR__ . '/db.php';
+
+function json_res($data, $code=200) {
+    http_response_code($code);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($data);
+    exit;
+}
+
+$m = $_SERVER['REQUEST_METHOD'];
+$a = $_REQUEST['action'] ?? null;
+
+if ($a === 'login' && $m === 'POST') {
+    $u = trim($_POST['username'] ?? '');
+    $p = $_POST['password'] ?? '';
+    if ($u === '' || $p === '') json_res(['error'=>'missing'],400);
+    $s = $pdo->prepare("SELECT id, password, display_name FROM users WHERE username = ? LIMIT 1");
+    $s->execute([$u]);
+    $x = $s->fetch();
+    if (!$x || !password_verify($p, $x['password'])) json_res(['error'=>'invalid_credentials'],401);
+    $_SESSION['user_id'] = (int)$x['id'];
+    $_SESSION['display_name'] = $x['display_name'];
+    json_res(['ok'=>true,'display_name'=>$x['display_name']]);
+}
+
+if ($a === 'logout') {
+    session_destroy();
+    json_res(['ok'=>true]);
+}
+
+if ($a === 'get_targets') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $us = $pdo->query("SELECT id, username, display_name FROM users ORDER BY display_name ASC")->fetchAll();
+    $gr = $pdo->query("SELECT g.id, g.name, g.creator_id, (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id=g.id AND gm.status='approved') AS member_count FROM groups g ORDER BY g.name ASC")->fetchAll();
+    json_res(['users'=>$us,'groups'=>$gr]);
+}
+
+if ($a === 'send_message' && $m === 'POST') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $me = $_SESSION['user_id'];
+    $b = trim($_POST['body'] ?? '');
+    $t = $_POST['type'] ?? 'public';
+    if ($b === '') json_res(['error'=>'empty'],400);
+    if ($t === 'public') {
+        $i = $pdo->prepare("INSERT INTO messages (sender_id, message) VALUES (?, ?)");
+        $i->execute([$me, $b]);
+        json_res(['ok'=>true]);
+    } elseif ($t === 'private') {
+        $r = intval($_POST['receiver_id'] ?? 0);
+        if (!$r) json_res(['error'=>'missing_receiver'],400);
+        $i = $pdo->prepare("INSERT INTO messages (sender_id, receiver_id, message) VALUES (?, ?, ?)");
+        $i->execute([$me, $r, $b]);
+        json_res(['ok'=>true]);
+    } elseif ($t === 'group') {
+        $g = intval($_POST['group_id'] ?? 0);
+        if (!$g) json_res(['error'=>'missing_group'],400);
+        $c = $pdo->prepare("SELECT id FROM group_members WHERE group_id = ? AND user_id = ? AND status = 'approved' LIMIT 1");
+        $c->execute([$g, $me]);
+        if (!$c->fetch()) json_res(['error'=>'not_member'],403);
+        $i = $pdo->prepare("INSERT INTO messages (sender_id, group_id, message) VALUES (?, ?, ?)");
+        $i->execute([$me, $g, $b]);
+        json_res(['ok'=>true]);
+    }
+    json_res(['error'=>'invalid_type'],400);
+}
+
+if ($a === 'messages') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $af = intval($_GET['after_id'] ?? 0);
+    $t = $_GET['type'] ?? 'public';
+    $me = $_SESSION['user_id'];
+    $o = [];
+    if ($t === 'public') {
+        $s = $pdo->prepare("SELECT m.*, u.display_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.group_id IS NULL AND m.receiver_id IS NULL AND m.id > ? ORDER BY m.id ASC");
+        $s->execute([$af]);
+        $rs = $s->fetchAll();
+    } elseif ($t === 'private') {
+        $ot = intval($_GET['user_id'] ?? 0);
+        $s = $pdo->prepare("SELECT m.*, u.display_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.receiver_id IS NOT NULL AND ((m.sender_id = ? AND m.receiver_id = ?) OR (m.sender_id = ? AND m.receiver_id = ?)) AND m.id > ? ORDER BY m.id ASC");
+        $s->execute([$me,$ot,$ot,$me,$af]);
+        $rs = $s->fetchAll();
+    } elseif ($t === 'group') {
+        $g = intval($_GET['group_id'] ?? 0);
+        $c = $pdo->prepare("SELECT id FROM group_members WHERE group_id = ? AND user_id = ? AND status = 'approved' LIMIT 1");
+        $c->execute([$g,$me]);
+        if (!$c->fetch()) json_res(['error'=>'not_member'],403);
+        $s = $pdo->prepare("SELECT m.*, u.display_name FROM messages m JOIN users u ON u.id = m.sender_id WHERE m.group_id = ? AND m.id > ? ORDER BY m.id ASC");
+        $s->execute([$g,$af]);
+        $rs = $s->fetchAll();
+    } else {
+        json_res(['error'=>'invalid_type'],400);
+    }
+    foreach($rs as $row){
+        $o[] = [
+            'id' => (int)$row['id'],
+            'sender_id' => (int)$row['sender_id'],
+            'sender_name' => $row['display_name'],
+            'message' => $row['message'],
+            'created_at' => $row['created_at'],
+            'is_me' => $row['sender_id'] == $me
+        ];
+    }
+    json_res(['messages'=>$o]);
+}
+
+if ($a === 'upload' && $m === 'POST') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    if (empty($_FILES['file'])) json_res(['error'=>'no_file'],400);
+    $f = $_FILES['file'];
+    if ($f['error'] !== UPLOAD_ERR_OK) json_res(['error'=>'upload_error'],400);
+    if ($f['size'] > 10*1024*1024) json_res(['error'=>'file_too_big'],400);
+
+    $fb = ['php','php3','php4','phtml','exe','sh','pl'];
+    $ext = strtolower(pathinfo($f['name'], PATHINFO_EXTENSION));
+    if (in_array($ext, $fb)) json_res(['error'=>'invalid_file_type'],400);
+
+    $ud = __DIR__ . '/uploads/';
+    if (!is_dir($ud)) mkdir($ud,0755,true);
+    $fn = time().'_'.bin2hex(random_bytes(6)).'_'.basename($f['name']);
+    $d = $ud . $fn;
+    if (!move_uploaded_file($f['tmp_name'], $d)) json_res(['error'=>'move_failed'],500);
+    $fp = '/uploads/' . $fn;
+
+    $se = $_SESSION['user_id'];
+    $de = trim($_POST['description'] ?? '');
+    $tt = $_POST['target_type'] ?? 'public';
+    $tu = null; $tg = null;
+
+    if ($tt === 'user') {
+        $tu = intval($_POST['target_user_id'] ?? 0);
+    } elseif ($tt === 'group') {
+        $tg = intval($_POST['target_group_id'] ?? 0);
+        $c = $pdo->prepare("SELECT id FROM group_members WHERE group_id = ? AND user_id = ? AND status='approved' LIMIT 1");
+        $c->execute([$tg,$se]);
+        if (!$c->fetch()) json_res(['error'=>'not_group_member'],403);
+    }
+
+    $i = $pdo->prepare("INSERT INTO files (sender_id, receiver_id, group_id, file_path, description) VALUES (?, ?, ?, ?, ?)");
+    $i->execute([$se, $tu, $tg, $fp, $de]);
+    json_res(['ok'=>true,'file_id'=>$pdo->lastInsertId(),'filepath'=>$fp]);
+}
+
+if ($a === 'get_files') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $fs = $pdo->prepare("SELECT f.*, u.display_name AS sender_name FROM files f JOIN users u ON u.id = f.sender_id ORDER BY f.created_at DESC");
+    $fs->execute();
+    $fl = $fs->fetchAll();
+    json_res(['files'=>$fl]);
+}
+
+if ($a === 'create_group' && $m === 'POST') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $n = trim($_POST['name'] ?? '');
+    if ($n === '') json_res(['error'=>'missing'],400);
+    $pdo->beginTransaction();
+    try {
+        $i = $pdo->prepare("INSERT INTO groups (name, creator_id) VALUES (?, ?)");
+        $i->execute([$n, $_SESSION['user_id']]);
+        $g = $pdo->lastInsertId();
+        $i2 = $pdo->prepare("INSERT INTO group_members (group_id, user_id, status, invited_by) VALUES (?, ?, 'approved', ?)");
+        $i2->execute([$g, $_SESSION['user_id'], $_SESSION['user_id']]);
+        $pdo->commit();
+        json_res(['ok'=>true,'group_id'=>$g]);
+    } catch(Exception $e){
+        $pdo->rollBack();
+        json_res(['error'=>'server'],500);
+    }
+}
+
+if ($a === 'invite_user' && $m === 'POST') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $gi = intval($_POST['group_id'] ?? 0);
+    $ui = intval($_POST['user_id'] ?? 0);
+    if (!$gi || !$ui) json_res(['error'=>'missing'],400);
+    $c = $pdo->prepare("SELECT id FROM group_members WHERE group_id = ? AND user_id = ? AND status='approved' LIMIT 1");
+    $c->execute([$gi, $_SESSION['user_id']]);
+    if (!$c->fetch()) json_res(['error'=>'not_allowed'],403);
+    $c2 = $pdo->prepare("SELECT id, status FROM group_members WHERE group_id = ? AND user_id = ? LIMIT 1");
+    $c2->execute([$gi, $ui]);
+    if ($c = $c2->fetch()) json_res(['ok'=>true,'note'=>'already','status'=>$c['status']]);
+    $i = $pdo->prepare("INSERT INTO group_members (group_id, user_id, status, invited_by) VALUES (?, ?, 'pending', ?)");
+    $i->execute([$gi, $ui, $_SESSION['user_id']]);
+    json_res(['ok'=>true]);
+}
+
+if ($a === 'respond_invite' && $m === 'POST') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $gi = intval($_POST['group_id'] ?? 0);
+    $ui = intval($_POST['user_id'] ?? 0);
+    $ac = $_POST['resp'] ?? '';
+    if (!$gi || !$ui || !in_array($ac,['accept','reject'])) json_res(['error'=>'invalid'],400);
+    if ($ui !== $_SESSION['user_id']) json_res(['error'=>'forbidden'],403);
+    $st = $ac === 'accept' ? 'approved' : 'rejected';
+    $up = $pdo->prepare("UPDATE group_members SET status = ? WHERE group_id = ? AND user_id = ? AND status = 'pending'");
+    $up->execute([$st, $gi, $ui]);
+    if ($up->rowCount()) json_res(['ok'=>true]); else json_res(['error'=>'not_found'],400);
+}
+
+if ($a === 'my_invites') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $me = $_SESSION['user_id'];
+    $s = $pdo->prepare("SELECT gm.group_id, gm.user_id, gm.status, g.name AS group_name, u.display_name AS invited_by_name FROM group_members gm JOIN groups g ON g.id = gm.group_id LEFT JOIN users u ON u.id = gm.invited_by WHERE gm.user_id = ? AND gm.status = 'pending' ORDER BY gm.created_at DESC");
+    $s->execute([$me]);
+    $in = $s->fetchAll();
+    json_res(['invites'=>$in]);
+}
+
+if ($a === 'my_groups') {
+    if (!isset($_SESSION['user_id'])) json_res(['error'=>'auth'],401);
+    $me = $_SESSION['user_id'];
+    $s = $pdo->prepare("SELECT g.id, g.name, (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id=g.id AND gm.status='approved') AS member_count FROM groups g JOIN group_members gm ON gm.group_id = g.id WHERE gm.user_id = ? AND gm.status = 'approved'");
+    $s->execute([$me]);
+    $gss = $s->fetchAll();
+    json_res(['groups'=>$gss]);
+}
+?>
+<!doctype html>
+<html lang="fa" dir="rtl">
 <head>
-  <meta charset="UTF-8">
-  <title>چت ساده با Supabase</title>
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js"></script>
-  <script src="script.js" defer></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>سیستم منابع انسانی - چت و مدیریت فایل</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --primary: #4361ee;
+  --primary-dark: #3a56d4;
+  --secondary: #3f37c9;
+  --success: #4cc9f0;
+  --danger: #f72585;
+  --warning: #f8961e;
+  --info: #4895ef;
+  --light: #f8f9fa;
+  --dark: #212529;
+  --muted: #6c757d;
+  --gray: #adb5bd;
+  --border: #dee2e6;
+  --shadow: 0 4px 12px rgba(0,0,0,0.08);
+  --radius: 12px;
+  --transition: all 0.3s ease;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: 'Vazirmatn', Tahoma, Arial, sans-serif;
+}
+
+body {
+  background: linear-gradient(135deg, #f5f7fa 0%, #e4edf5 100%);
+  color: var(--dark);
+  line-height: 1.6;
+  min-height: 100vh;
+  padding-bottom: 40px;
+}
+
+header {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+  color: white;
+  padding: 16px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.logo {
+  font-weight: 700;
+  font-size: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo::before {
+  content: "💼";
+  font-size: 1.8rem;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 30px auto;
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  gap: 24px;
+  padding: 0 16px;
+}
+
+.card {
+  background: white;
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow);
+  transition: var(--transition);
+  border: 1px solid rgba(255,255,255,0.2);
+}
+
+.card:hover {
+  box-shadow: 0 8px 20px rgba(0,0,0,0.12);
+}
+
+.nav-tabs {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.tab-btn {
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 0;
+  background: var(--light);
+  color: var(--muted);
+  cursor: pointer;
+  transition: var(--transition);
+  flex: 1;
+  text-align: center;
+  font-weight: 500;
+}
+
+.tab-btn.active {
+  background: var(--primary);
+  color: white;
+  box-shadow: 0 4px 8px rgba(67, 97, 238, 0.3);
+}
+
+.tab-btn:hover:not(.active) {
+  background: #e9ecef;
+  color: var(--dark);
+}
+
+.section {
+  display: none;
+  animation: fadeIn 0.5s ease;
+}
+
+.section.active {
+  display: block;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+#messages {
+  height: 65vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  padding: 16px;
+  border-radius: var(--radius);
+  background: var(--light);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.msg {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background: white;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+  max-width: 80%;
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  animation: slideIn 0.3s ease;
+}
+
+.msg.me {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--info) 100%);
+  color: white;
+  align-self: flex-end;
+  border: none;
+}
+
+.msg strong {
+  font-size: 0.9rem;
+  display: block;
+  margin-bottom: 4px;
+}
+
+.msg .small {
+  font-size: 0.75rem;
+  opacity: 0.8;
+  margin-top: 4px;
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.controls {
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+input[type="text"], textarea, select {
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  width: 100%;
+  transition: var(--transition);
+  font-size: 1rem;
+}
+
+input[type="text"]:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.1);
+}
+
+button.primary {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+  color: white;
+  border: 0;
+  padding: 12px 20px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: var(--transition);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+button.primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 12px rgba(67, 97, 238, 0.3);
+}
+
+.small {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+footer {
+  margin-top: 40px;
+  text-align: center;
+  color: var(--muted);
+  padding: 20px;
+  font-size: 0.9rem;
+}
+
+.top-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.pill {
+  background: rgba(255,255,255,0.2);
+  padding: 8px 16px;
+  border-radius: 50px;
+  border: 1px solid rgba(255,255,255,0.3);
+  color: white;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  backdrop-filter: blur(10px);
+}
+
+.pill:hover {
+  background: rgba(255,255,255,0.3);
+  cursor: pointer;
+}
+
+.list-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.list-inline a {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: var(--dark);
+  text-decoration: none;
+  transition: var(--transition);
+}
+
+.list-inline a:hover {
+  background: var(--light);
+  color: var(--primary);
+}
+
+hr {
+  border: none;
+  height: 1px;
+  background: var(--border);
+  margin: 20px 0;
+}
+
+h3, h4 {
+  color: var(--dark);
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+h3::before, h4::before {
+  font-size: 1.2em;
+}
+
+#tab-chat h3::before { content: "💬"; }
+#tab-files h3::before { content: "📁"; }
+#tab-groups h3::before { content: "👥"; }
+
+.flex-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+#loginModal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(5px);
+}
+
+#loginModal > div {
+  background: white;
+  padding: 30px;
+  border-radius: var(--radius);
+  width: 90%;
+  max-width: 400px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+  animation: modalAppear 0.4s ease;
+}
+
+@keyframes modalAppear {
+  from { opacity: 0; transform: scale(0.9) translateY(20px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.file-item {
+  padding: 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+  transition: var(--transition);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.file-item:hover {
+  border-color: var(--primary);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+
+.file-info {
+  flex: 1;
+}
+
+.file-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  transition: var(--transition);
+  font-size: 0.9rem;
+}
+
+.btn-success {
+  background: var(--success);
+  color: white;
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: white;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--dark);
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+@media (max-width: 768px) {
+  .container {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+  
+  #messages {
+    height: 50vh;
+  }
+  
+  .flex-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  
+  .controls {
+    flex-direction: column;
+  }
+}
+</style>
 </head>
 <body>
-  <h2>ارسال پیام</h2>
-  <form id="chatForm">
-    <input type="text" id="messageInput" placeholder="پیام خود را بنویسید">
-    <button type="submit">ارسال</button>
-  </form>
-  <div id="chatBox"></div>
+<header>
+  <div class="logo">سیستم منابع انسانی</div>
+  <div class="top-actions">
+    <div class="pill" id="who">وارد نشده</div>
+    <button onclick="doLogout()" class="pill">🚪 خروج</button>
+  </div>
+</header>
+
+<div class="container">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <strong>منو اصلی</strong>
+      <div class="small">انتخاب کنید</div>
+    </div>
+
+    <div class="nav-tabs">
+      <button class="tab-btn active" data-tab="chat">💬 چت</button>
+      <button class="tab-btn" data-tab="files">📁 فایل‌ها</button>
+      <button class="tab-btn" data-tab="groups">👥 گروه‌ها</button>
+    </div>
+
+    <div class="list-inline">
+      <a href="/create_user.php">🔧 مدیریت کاربران</a>
+      <a href="#" id="refreshTargets">🔄 بروزرسانی لیست</a>
+      <div class="small">طراحی شده توسط تیم حضور و غیاب</div>
+    </div>
+  </div>
+
+  <div>
+    <!-- CHAT SECTION -->
+    <div class="card section active" id="tab-chat">
+      <h3>پیام‌رسانی</h3>
+      <div class="flex-row">
+        <label class="small">انتخاب نوع چت:</label>
+        <select id="chatType" style="width:220px">
+          <option value="public">💬 عمومی (همه)</option>
+          <optgroup label="👤 کاربران" id="usersOpt"></optgroup>
+          <optgroup label="👥 گروه‌ها" id="groupsOpt"></optgroup>
+        </select>
+        <button id="refreshMsgs" class="primary" style="margin-right:auto">🔄 بارگذاری</button>
+      </div>
+      <div id="messages"></div>
+
+      <div class="controls">
+        <input type="text" id="chatInput" placeholder="پیام خود را اینجا بنویسید...">
+        <button id="sendBtn" class="primary">📤 ارسال</button>
+      </div>
+    </div>
+
+    <!-- FILES SECTION -->
+    <div class="card section" id="tab-files">
+      <h3>مدیریت فایل‌ها</h3>
+      <form id="uploadForm">
+        <input type="file" id="fileInput" required style="margin-bottom:12px">
+        <textarea id="fileDesc" rows="3" placeholder="توضیحات فایل..."></textarea>
+        <select id="fileTarget" style="margin-top:12px">
+          <option value="public">🌐 عمومی</option>
+          <optgroup label="👤 کاربران" id="fileUsers"></optgroup>
+          <optgroup label="👥 گروه‌ها" id="fileGroups"></optgroup>
+        </select>
+        <div style="margin-top:16px">
+          <button class="primary" type="submit">📤 آپلود و ارسال</button>
+        </div>
+      </form>
+
+      <hr>
+      <h4>📂 فایل‌های اخیر</h4>
+      <div id="filesList"></div>
+    </div>
+
+    <!-- GROUPS SECTION -->
+    <div class="card section" id="tab-groups">
+      <h3>مدیریت گروه‌ها</h3>
+      <div>
+        <input id="newGroupName" placeholder="نام گروه جدید">
+        <button id="createGroupBtn" class="primary" style="margin-top:12px">➕ ساخت گروه</button>
+      </div>
+
+      <hr>
+      <h4>📩 دعوت اعضا</h4>
+      <div class="flex-row">
+        <select id="groupsForInvite"></select>
+        <select id="usersForInvite"></select>
+        <button id="inviteBtn" class="primary">📤 ارسال دعوت</button>
+      </div>
+
+      <hr>
+      <h4>📨 دعوت‌های من</h4>
+      <div id="myInvites">در حال بارگذاری...</div>
+
+      <hr>
+      <h4>👥 گروه‌های من</h4>
+      <div id="myGroups">در حال بارگذاری...</div>
+    </div>
+  </div>
+</div>
+
+<footer>© طراحی شده توسط تیم حضور و غیاب - کلیه حقوق محفوظ است</footer>
+
+<script>
+/* --- helpers --- */
+function el(q){ return document.querySelector(q); }
+function els(q){ return Array.from(document.querySelectorAll(q)); }
+function showTab(name){
+  els('.tab-btn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  els('.section').forEach(s=>s.classList.toggle('active', s.id==='tab-'+name));
+}
+els('.tab-btn').forEach(b=>b.addEventListener('click', ()=> showTab(b.dataset.tab)));
+
+/* --- auth state --- */
+let displayName = localStorage.getItem('display_name') || null;
+if (displayName) {
+  document.getElementById('who').textContent = displayName;
+} else {
+  showLoginPrompt();
+}
+
+/* --- Login prompt (simple) --- */
+function showLoginPrompt(){
+  const html = `
+    <div id="loginModal" style="position:fixed;inset:0;background:rgba(0,0,0,0.4);display:flex;align-items:center;justify-content:center;z-index:9999">
+      <div style="background:#fff;padding:30px;border-radius:12px;min-width:320px;box-shadow:0 10px 25px rgba(0,0,0,0.2)">
+        <h3 style="margin-bottom:20px;text-align:center">ورود به سیستم</h3>
+        <input id="login_user" placeholder="نام کاربری" style="width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:8px" />
+        <input id="login_pass" type="password" placeholder="رمز عبور" style="width:100%;padding:12px;margin:8px 0;border:1px solid #ddd;border-radius:8px" />
+        <div style="display:flex;gap:10px;margin-top:20px">
+          <button id="doLogin" class="primary" style="flex:1">ورود</button>
+          <a href="/create_user.php" style="align-self:center;padding:10px;color:#4361ee;text-decoration:none">ساخت کاربر</a>
+        </div>
+        <div id="loginErr" style="color:#c62828;margin-top:12px;text-align:center"></div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('doLogin').addEventListener('click', async ()=>{
+    const u = document.getElementById('login_user').value.trim();
+    const p = document.getElementById('login_pass').value;
+    if(!u||!p) { document.getElementById('loginErr').textContent='نام کاربری و رمز عبور ضروری است'; return; }
+    const form = new FormData();
+    form.append('action','login');
+    form.append('username', u);
+    form.append('password', p);
+    const res = await fetch('index.php',{method:'POST', body: form});
+    const j = await res.json();
+    if (j.ok) {
+      localStorage.setItem('display_name', j.display_name);
+      displayName = j.display_name;
+      document.getElementById('who').textContent = displayName;
+      document.getElementById('loginModal').remove();
+      loadTargets();
+      loadFiles();
+      loadMyInvites();
+      loadMyGroups();
+      poll();
+    } else {
+      document.getElementById('loginErr').textContent = j.error === 'invalid_credentials' ? 'نام کاربری یا رمز عبور نادرست' : 'خطا در ورود';
+    }
+  });
+}
+
+/* --- logout --- */
+async function doLogout(){
+  await fetch('index.php?action=logout');
+  localStorage.removeItem('display_name');
+  location.reload();
+}
+
+/* --- load targets (users/groups) --- */
+async function loadTargets(){
+  const res = await fetch('index.php?action=get_targets');
+  if (!res.ok) return;
+  const j = await res.json();
+  // users
+  const usersOpt = document.getElementById('usersOpt');
+  const groupsOpt = document.getElementById('groupsOpt');
+  const fileUsers = document.getElementById('fileUsers');
+  const fileGroups = document.getElementById('fileGroups');
+  const groupsForInvite = document.getElementById('groupsForInvite');
+  const usersForInvite = document.getElementById('usersForInvite');
+
+  usersOpt.innerHTML = ''; groupsOpt.innerHTML = '';
+  fileUsers.innerHTML = ''; fileGroups.innerHTML = '';
+  groupsForInvite.innerHTML = ''; usersForInvite.innerHTML = '';
+
+  j.users.forEach(u=>{
+    const o1 = document.createElement('option'); o1.value = 'user_'+u.id; o1.textContent = u.display_name + ' ('+u.username+')'; usersOpt.appendChild(o1);
+    const o2 = document.createElement('option'); o2.value = u.id; o2.textContent = u.display_name + ' ('+u.username+')'; usersForInvite.appendChild(o2);
+    const fu = document.createElement('option'); fu.value = 'user_'+u.id; fu.textContent = u.display_name; fileUsers.appendChild(fu);
+  });
+  j.groups.forEach(g=>{
+    const o = document.createElement('option'); o.value = 'group_'+g.id; o.textContent = g.name + ` (${g.member_count} عضو)`; groupsOpt.appendChild(o);
+    const fg = document.createElement('option'); fg.value = 'group_'+g.id; fg.textContent = g.name + ` (${g.member_count} عضو)`; fileGroups.appendChild(fg);
+    const gg = document.createElement('option'); gg.value = g.id; gg.textContent = g.name + ` (${g.member_count} عضو)`; groupsForInvite.appendChild(gg);
+  });
+}
+
+/* --- sending messages --- */
+document.getElementById('sendBtn').addEventListener('click', sendMessage);
+document.getElementById('refreshMsgs').addEventListener('click', ()=>{ lastId=0; document.getElementById('messages').innerHTML=''; });
+
+async function sendMessage(){
+  const txt = document.getElementById('chatInput').value.trim();
+  if (!txt) return;
+  const typeSel = document.getElementById('chatType').value;
+  const form = new FormData();
+  form.append('action','send_message');
+  form.append('body', txt);
+  if (typeSel === 'public') form.append('type','public');
+  else if (typeSel.startsWith('user_')) { form.append('type','private'); form.append('receiver_id', typeSel.split('_')[1]); }
+  else if (typeSel.startsWith('group_')) { form.append('type','group'); form.append('group_id', typeSel.split('_')[1]); }
+  const res = await fetch('index.php',{method:'POST', body: form});
+  const j = await res.json();
+  if (j.ok) { document.getElementById('chatInput').value=''; }
+  else alert(j.error || 'خطا در ارسال پیام');
+}
+
+/* --- polling messages --- */
+let lastId = 0;
+let polling = false;
+async function poll(){
+  if (!displayName) return;
+  if (polling) return;
+  polling = true;
+  try {
+    const typeSel = document.getElementById('chatType').value;
+    const qs = new URLSearchParams();
+    qs.set('action','messages');
+    qs.set('after_id', lastId);
+    if (typeSel === 'public') qs.set('type','public');
+    else if (typeSel.startsWith('user_')) { qs.set('type','private'); qs.set('user_id', typeSel.split('_')[1]); }
+    else if (typeSel.startsWith('group_')) { qs.set('type','group'); qs.set('group_id', typeSel.split('_')[1]); }
+    const res = await fetch('index.php?'+qs.toString());
+    if (!res.ok) throw new Error('fetch');
+    const j = await res.json();
+    if (j.messages && j.messages.length) {
+      const container = document.getElementById('messages');
+      j.messages.forEach(m=>{
+        lastId = Math.max(lastId, m.id);
+        const d = document.createElement('div');
+        d.className = 'msg' + (m.is_me ? ' me' : '');
+        d.innerHTML = `<strong>${escapeHtml(m.sender_name)}</strong> <div>${escapeHtml(m.message)}</div><div class="small">${formatDate(m.created_at)}</div>`;
+        container.appendChild(d);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+  } catch(e){}
+  polling = false;
+  setTimeout(poll, 2000);
+}
+
+/* --- file upload --- */
+document.getElementById('uploadForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const f = document.getElementById('fileInput').files[0];
+  if (!f) return alert('لطفا یک فایل انتخاب کنید');
+  if (f.size > 10*1024*1024) return alert('حجم فایل باید کمتر از 10MB باشد');
+  const desc = document.getElementById('fileDesc').value;
+  const tgt = document.getElementById('fileTarget').value;
+  const form = new FormData();
+  form.append('action','upload');
+  form.append('file', f);
+  form.append('description', desc);
+  if (tgt === 'public') form.append('target_type','public');
+  else if (tgt.startsWith('user_')) { form.append('target_type','user'); form.append('target_user_id', tgt.split('_')[1]); }
+  else if (tgt.startsWith('group_')) { form.append('target_type','group'); form.append('target_group_id', tgt.split('_')[1]); }
+  const res = await fetch('index.php',{method:'POST', body: form});
+  const j = await res.json();
+  if (j.ok) { alert('فایل با موفقیت آپلود شد'); loadFiles(); document.getElementById('fileDesc').value=''; document.getElementById('fileInput').value=''; }
+  else alert(j.error || 'خطا در آپلود فایل');
+});
+
+/* --- load files --- */
+async function loadFiles(){
+  const res = await fetch('index.php?action=get_files');
+  if (!res.ok) return;
+  const j = await res.json();
+  const list = document.getElementById('filesList'); list.innerHTML = '';
+  j.files.forEach(f=>{
+    const div = document.createElement('div');
+    div.className = 'file-item';
+    div.innerHTML = `
+      <div class="file-info">
+        <strong>${escapeHtml(f.filename || 'فایل')}</strong>
+        <div class="small">ارسال‌کننده: ${escapeHtml(f.sender_name)}</div>
+        <div class="small">${escapeHtml(f.description||'بدون توضیح')}</div>
+        <div class="small">${formatDate(f.created_at)}</div>
+      </div>
+      <div class="file-actions">
+        <a href="${escapeHtml(f.file_path)}" target="_blank" class="btn btn-success">📥 دانلود</a>
+      </div>
+    `;
+    list.appendChild(div);
+  });
+}
+
+/* --- groups: create/invite/respond --- */
+document.getElementById('createGroupBtn').addEventListener('click', async ()=>{
+  const nm = document.getElementById('newGroupName').value.trim();
+  if (!nm) return alert('لطفا نام گروه را وارد کنید');
+  const f = new FormData(); f.append('action','create_group'); f.append('name', nm);
+  const r = await fetch('index.php',{method:'POST', body: f}); const j = await r.json();
+  if (j.ok) { alert('گروه با موفقیت ایجاد شد'); loadTargets(); loadMyGroups(); } else alert(j.error || 'خطا در ایجاد گروه');
+});
+
+document.getElementById('inviteBtn').addEventListener('click', async ()=>{
+  const gid = document.getElementById('groupsForInvite').value;
+  const uid = document.getElementById('usersForInvite').value;
+  if (!gid || !uid) return alert('لطفا گروه و کاربر را انتخاب کنید');
+  const f = new FormData(); f.append('action','invite_user'); f.append('group_id', gid); f.append('user_id', uid);
+  const r = await fetch('index.php',{method:'POST', body: f}); const j = await r.json();
+  if (j.ok) { alert('دعوت‌نامه ارسال شد'); loadMyInvites(); } else alert(j.error || 'خطا در ارسال دعوت');
+});
+
+async function loadMyInvites(){
+  const r = await fetch('index.php?action=my_invites'); if (!r.ok) return;
+  const j = await r.json(); const el = document.getElementById('myInvites'); el.innerHTML='';
+  (j.invites||[]).forEach(inv=>{
+    const d = document.createElement('div'); d.style.padding='12px 0'; d.style.borderBottom='1px solid #eee'; d.innerHTML = `
+      <strong>${escapeHtml(inv.group_name)}</strong>
+      <div class="small">دعوت‌شده توسط: ${escapeHtml(inv.invited_by_name)}</div>
+    `;
+    const a = document.createElement('button'); a.textContent='✅ پذیرش'; a.className='btn btn-success';
+    a.onclick = async ()=>{ 
+      const f = new FormData(); 
+      f.append('action','respond_invite'); 
+      f.append('group_id', inv.group_id); 
+      f.append('user_id', inv.user_id); 
+      f.append('resp','accept'); 
+      const rr = await fetch('index.php',{method:'POST', body: f}); 
+      const jj = await rr.json(); 
+      if (jj.ok) { alert('دعوت پذیرفته شد'); loadMyInvites(); loadMyGroups(); } else alert(jj.error||'خطا');
+    };
+    const rj = document.createElement('button'); rj.textContent='❌ رد'; rj.className='btn btn-danger'; rj.style.marginRight='8px';
+    rj.onclick = async ()=>{ 
+      const f = new FormData(); 
+      f.append('action','respond_invite'); 
+      f.append('group_id', inv.group_id); 
+      f.append('user_id', inv.user_id); 
+      f.append('resp','reject'); 
+      const rr = await fetch('index.php',{method:'POST', body: f}); 
+      const jj = await rr.json(); 
+      if (jj.ok) { alert('دعوت رد شد'); loadMyInvites(); } else alert(jj.error||'خطا');
+    };
+    d.appendChild(rj);
+    d.appendChild(a);
+    el.appendChild(d);
+  });
+}
+
+async function loadMyGroups(){
+  const r = await fetch('index.php?action=my_groups'); if (!r.ok) return;
+  const j = await r.json(); const el = document.getElementById('myGroups'); el.innerHTML='';
+  (j.groups||[]).forEach(g=>{ 
+    const d=document.createElement('div'); 
+    d.style.padding='10px 0'; 
+    d.style.borderBottom='1px solid #eee'; 
+    d.textContent = `👥 ${g.name} — ${g.member_count} عضو`; 
+    el.appendChild(d); 
+  });
+}
+
+/* --- utility --- */
+function escapeHtml(s){ 
+  if(!s) return ''; 
+  return s.toString()
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#039;');
+}
+
+function formatDate(dateString) {
+  const date = new Date(dateString);
+  return date.toLocaleDateString('fa-IR') + ' ' + date.toLocaleTimeString('fa-IR');
+}
+
+/* --- initial load --- */
+if (displayName) {
+  loadTargets();
+  loadFiles();
+  loadMyInvites();
+  loadMyGroups();
+  poll();
+}
+
+document.getElementById('refreshTargets').addEventListener('click', ()=>loadTargets());
+</script>
 </body>
 </html>
